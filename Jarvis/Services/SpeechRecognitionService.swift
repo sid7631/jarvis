@@ -2,6 +2,11 @@ import Speech
 import AVFoundation
 
 /// Handles speech-to-text and wake word detection using SFSpeechRecognizer + AVAudioEngine.
+///
+/// Key design: the AVAudioEngine and its tap run continuously once started.
+/// Switching between wake-word and active-listening mode only swaps the
+/// SFSpeechAudioBufferRecognitionRequest — the engine never stops between modes,
+/// so no audio is dropped in the transition.
 @MainActor
 final class SpeechRecognitionService {
     enum Mode {
@@ -12,6 +17,8 @@ final class SpeechRecognitionService {
     // MARK: - Callbacks (always called on main actor)
 
     var onWakeWordDetected: ((String?) -> Void)?
+    /// Fired when the user says "stop" during wake word listening.
+    var onStopWordDetected: (() -> Void)?
     var onPartialResult: ((String) -> Void)?
     var onFinalResult: ((String) -> Void)?
     var onAudioLevel: ((Double) -> Void)?
@@ -31,17 +38,6 @@ final class SpeechRecognitionService {
     private var lastResultText: String = ""
     private var isAuthorized = false
     private var recognitionSessionID = UUID()
-
-    nonisolated private func debugLog(_ message: String) {
-#if DEBUG
-        print("[SpeechRecognitionService] \(message)")
-#endif
-    }
-
-    private func emitDebugEvent(_ message: String) {
-        debugLog(message)
-        onDebugEvent?(message)
-    }
 
     // MARK: - Permissions
 
@@ -63,20 +59,16 @@ final class SpeechRecognitionService {
 
         switch micStatus {
         case .authorized:
-            emitDebugEvent("Microphone authorization already granted")
             micGranted = true
         case .notDetermined:
-            emitDebugEvent("Requesting microphone access")
             micGranted = await withCheckedContinuation { continuation in
                 AVCaptureDevice.requestAccess(for: .audio) { granted in
                     continuation.resume(returning: granted)
                 }
             }
         case .denied, .restricted:
-            emitDebugEvent("Microphone authorization status: \(micStatus.rawValue)")
             micGranted = false
         @unknown default:
-            emitDebugEvent("Unknown microphone authorization status: \(micStatus.rawValue)")
             micGranted = false
         }
 
@@ -102,11 +94,7 @@ final class SpeechRecognitionService {
             return
         }
 
-        stopListening(forceCancel: true)
-        currentMode = .wakeWord
-        onModeChanged?("wake")
-        emitDebugEvent("Starting wake word detection")
-        startRecognition { [weak self] result, error in
+        beginRecognitionSession(mode: .wakeWord) { [weak self] result, error in
             guard let self else { return }
 
             if let result {
@@ -122,8 +110,17 @@ final class SpeechRecognitionService {
 
                     if let trailingText = self.extractTrailingText(after: "jarvis", in: text) {
                         self.emitDebugEvent("Wake word detected")
-                        self.stopListening()
+                        // Rotate session so pending callbacks from this task are ignored.
+                        // Engine keeps running — startActiveListening will reuse it.
+                        self.invalidateCurrentSession()
                         self.onWakeWordDetected?(trailingText)
+                        return
+                    }
+
+                    if self.detectsStopCommand(in: text) {
+                        self.emitDebugEvent("Stop command detected")
+                        self.invalidateCurrentSession()
+                        self.onStopWordDetected?()
                         return
                     }
 
@@ -153,14 +150,9 @@ final class SpeechRecognitionService {
             return
         }
 
-        stopListening(forceCancel: true)
-        currentMode = .activeListening
         lastResultText = ""
-        resetSilenceTimer()
-        onModeChanged?("active")
-        emitDebugEvent("Starting active listening")
 
-        startRecognition { [weak self] result, error in
+        beginRecognitionSession(mode: .activeListening) { [weak self] result, error in
             guard let self else { return }
 
             if let result {
@@ -191,15 +183,21 @@ final class SpeechRecognitionService {
                         self.finishActiveListening()
                     } else {
                         self.onError?(error?.localizedDescription ?? "Recognition failed")
-                        self.stopListening()
+                        self.invalidateCurrentSession()
+                        self.onModeChanged?("idle")
                     }
                 }
             }
         }
+
+        resetSilenceTimer()
     }
 
-    // MARK: - Stop
+    // MARK: - Full Stop
 
+    /// Completely tears down the audio engine. Only call when going fully offline
+    /// (e.g. VoiceManager.stop()). For mode switches, use startWakeWordDetection /
+    /// startActiveListening directly — they reuse the running engine.
     func stopListening(forceCancel: Bool = false) {
         recognitionSessionID = UUID()
         silenceTimer?.invalidate()
@@ -211,7 +209,6 @@ final class SpeechRecognitionService {
         }
 
         recognitionRequest?.endAudio()
-
         if forceCancel {
             recognitionTask?.cancel()
         }
@@ -222,30 +219,64 @@ final class SpeechRecognitionService {
         onModeChanged?("idle")
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Private: Session Switching
 
-    private func startRecognition(resultHandler: @escaping @Sendable (SFSpeechRecognitionResult?, Error?) -> Void) {
+    /// Starts a new recognition session. If the audio engine is already running
+    /// its tap will immediately feed audio into the new request — no gap.
+    private func beginRecognitionSession(
+        mode: Mode,
+        handler: @escaping @Sendable (SFSpeechRecognitionResult?, Error?) -> Void
+    ) {
         guard let speechRecognizer, speechRecognizer.isAvailable else {
-            emitDebugEvent("Speech recognizer unavailable for locale \(speechRecognizer?.locale.identifier ?? "unknown")")
+            emitDebugEvent("Speech recognizer unavailable")
             onError?("Speech recognition unavailable")
             return
         }
 
-        let sessionID = recognitionSessionID
+        // Cancel the previous recognition task, but leave the engine running.
+        let sessionID = UUID()
+        recognitionSessionID = sessionID
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+
+        currentMode = mode
+        onModeChanged?(mode == .wakeWord ? "wake" : "active")
+        emitDebugEvent(mode == .wakeWord ? "Starting wake word detection" : "Starting active listening")
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        request.taskHint = currentMode == .wakeWord ? .confirmation : .dictation
-
+        request.taskHint = mode == .wakeWord ? .confirmation : .dictation
         recognitionRequest = request
+
+        // Ensure the audio engine is running. If already running (the common case
+        // during a mode switch), the existing tap starts feeding `request` immediately.
+        ensureAudioEngineRunning()
+
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self, sessionID == self.recognitionSessionID else { return }
+            handler(result, error)
+        }
+        emitDebugEvent("Recognition task created (on-device: \(speechRecognizer.supportsOnDeviceRecognition))")
+    }
+
+    /// Starts the audio engine and installs the tap if not already running.
+    /// The tap closure always feeds `self.recognitionRequest`, which is updated
+    /// on every mode switch — so no reinstallation is needed.
+    private func ensureAudioEngineRunning() {
+        guard !audioEngine.isRunning else { return }
 
         let inputNode = audioEngine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-            request.append(buffer)
+            guard buffer.frameLength > 0 else { return }
+            // Feed to whatever request is current — automatically correct after a swap.
+            self?.recognitionRequest?.append(buffer)
 
-            // Compute RMS audio level
             guard let channelData = buffer.floatChannelData?[0] else { return }
             let frameLength = Int(buffer.frameLength)
             var sum: Float = 0
@@ -254,7 +285,6 @@ final class SpeechRecognitionService {
             }
             let rms = sqrt(sum / Float(frameLength))
             let level = min(Double(rms * 5), 1.0)
-
             Task { @MainActor [weak self] in
                 self?.onAudioLevel?(level)
             }
@@ -267,15 +297,22 @@ final class SpeechRecognitionService {
         } catch {
             emitDebugEvent("Audio engine failed: \(error.localizedDescription)")
             onError?("Audio engine failed to start: \(error.localizedDescription)")
-            return
         }
-
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { result, error in
-            guard sessionID == self.recognitionSessionID else { return }
-            resultHandler(result, error)
-        }
-        emitDebugEvent("Recognition task created. On-device supported: \(speechRecognizer.supportsOnDeviceRecognition)")
     }
+
+    /// Cancels the current recognition task without stopping the audio engine.
+    private func invalidateCurrentSession() {
+        recognitionSessionID = UUID()
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        currentMode = nil
+    }
+
+    // MARK: - Private: Active Listening Helpers
 
     private func resetSilenceTimer() {
         silenceTimer?.invalidate()
@@ -288,15 +325,18 @@ final class SpeechRecognitionService {
 
     private func finishActiveListening() {
         let finalText = lastResultText
-        stopListening()
+        // Cancel recognition without stopping the engine.
+        invalidateCurrentSession()
+        onModeChanged?("idle")
         if !finalText.isEmpty {
             onFinalResult?(finalText)
         }
     }
 
+    // MARK: - Private: Wake Word Helpers
+
     private func scheduleWakeWordRestart() {
         guard currentMode == .wakeWord else { return }
-
         Task { @MainActor [weak self] in
             guard let self, self.currentMode == .wakeWord else { return }
             try? await Task.sleep(for: .milliseconds(300))
@@ -308,13 +348,33 @@ final class SpeechRecognitionService {
     private func extractTrailingText(after wakeWord: String, in transcript: String) -> String? {
         guard let range = transcript.range(of: wakeWord) else { return nil }
 
+        // Primary: take text after the wake word ("jarvis open safari" → "open safari")
         let trailing = transcript[range.upperBound...]
             .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        if !trailing.isEmpty { return String(trailing) }
 
-        if trailing.isEmpty {
-            return ""
-        }
+        // Fallback: the recognizer sometimes appends "jarvis" at the very end
+        // ("open safari jarvis" / "service open safari jarvis").
+        // Use the text that came BEFORE the wake word as the command so the
+        // user doesn't have to repeat themselves.
+        let preceding = transcript[..<range.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        return preceding.isEmpty ? "" : String(preceding)
+    }
 
-        return String(trailing)
+    private func detectsStopCommand(in transcript: String) -> Bool {
+        let words = transcript
+            .components(separatedBy: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            .filter { !$0.isEmpty }
+        return words.contains("stop")
+    }
+
+    // MARK: - Logging
+
+    private func emitDebugEvent(_ message: String) {
+#if DEBUG
+        print("[SpeechRecognitionService] \(message)")
+#endif
+        onDebugEvent?(message)
     }
 }

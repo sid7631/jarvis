@@ -13,6 +13,8 @@ final class VoiceManager {
     private var streamingTask: Task<Void, Never>?
     private var shouldResumeWakeListeningAfterSpeech = true
     private var ignoreNextSpeechFinishedCallback = false
+    /// Persisted for the lifetime of this VoiceManager so all turns share context.
+    private let conversationId = UUID().uuidString
 
     private(set) var isRunning = false
 
@@ -74,7 +76,9 @@ final class VoiceManager {
     private func handleWakeWord(initialText: String? = nil) {
         listeningVerificationTask?.cancel()
         listeningVerificationTask = nil
-        ignoreNextSpeechFinishedCallback = false
+        // Do NOT reset ignoreNextSpeechFinishedCallback here.
+        // interruptSpeechAndListen() sets it to true before calling us,
+        // and we must preserve that so the async didFinish from stop() is ignored.
         state.errorMessage = nil
         let seededText = initialText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
@@ -102,7 +106,7 @@ final class VoiceManager {
 
         streamingTask = Task {
             do {
-                let request = ChatRequest(message: text, conversationId: nil)
+                let request = ChatRequest(message: text, conversationId: conversationId)
                 let stream = try await backend.streamResponse(request)
 
                 var buffer = ""
@@ -229,15 +233,16 @@ final class VoiceManager {
     private func scheduleListeningVerificationResponse() {
         listeningVerificationTask?.cancel()
         listeningVerificationTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2))
+            // 5 seconds: gives the user ample time to speak after an interruption
+            // or audio engine restart before the canned verification fires.
+            try? await Task.sleep(for: .seconds(5))
             guard let self else { return }
             guard !Task.isCancelled else { return }
             guard self.state.phase == .listening else { return }
             guard self.state.transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
-            self.state.debugSpeechEvent = "Using mock reply for voice verification"
-            self.recognitionService.stopListening(forceCancel: true)
-            self.handleResponse("Voice systems are online and operational.")
+            self.state.debugSpeechEvent = "No speech detected — returning to idle"
+            self.returnToIdle()
         }
     }
 
@@ -250,6 +255,23 @@ final class VoiceManager {
                 self.interruptSpeechAndListen(initialText: trailingText)
             } else {
                 self.handleWakeWord(initialText: trailingText)
+            }
+        }
+
+        recognitionService.onStopWordDetected = { [weak self] in
+            guard let self else { return }
+            switch self.state.phase {
+            case .speaking:
+                // Stop speech + streaming immediately and return to idle.
+                self.cancelStreaming()
+                self.ignoreNextSpeechFinishedCallback = true
+                self.speechSynthesizer.stop()
+                self.returnToIdle()
+            case .listening:
+                // Cancel active listening and return to idle.
+                self.returnToIdle()
+            case .idle, .thinking:
+                break
             }
         }
 
@@ -293,6 +315,9 @@ final class VoiceManager {
                 self.ignoreNextSpeechFinishedCallback = false
                 return
             }
+            // Stale didFinish callbacks can arrive after an interrupt while we
+            // are already in listening/idle/thinking. Only act when speaking.
+            guard self.state.phase == .speaking else { return }
             self.returnToIdle()
         }
     }

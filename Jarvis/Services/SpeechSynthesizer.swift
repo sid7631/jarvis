@@ -4,6 +4,7 @@ import AVFoundation
 final class SpeechSynthesizer: NSObject, @unchecked Sendable, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
     private let voice: AVSpeechSynthesisVoice?
+    private var pendingUtterances = 0
     private static let preferredFemaleNames = [
         "serena",
         "martha",
@@ -14,7 +15,7 @@ final class SpeechSynthesizer: NSObject, @unchecked Sendable, AVSpeechSynthesize
         "victoria"
     ]
 
-    /// Called on the main actor when the current utterance finishes.
+    /// Called on the main actor when ALL queued utterances have finished.
     @MainActor var onFinished: (() -> Void)?
 
     override init() {
@@ -25,30 +26,45 @@ final class SpeechSynthesizer: NSObject, @unchecked Sendable, AVSpeechSynthesize
 
     // MARK: - Public
 
+    /// Stops any in-progress speech and starts speaking `text` immediately.
     @MainActor
     func speak(_ text: String) {
         synthesizer.stopSpeaking(at: .immediate)
+        pendingUtterances = 0
+        enqueue(text)
+    }
 
+    /// Appends `text` to the speech queue without interrupting the current utterance.
+    @MainActor
+    func enqueue(_ text: String) {
+        pendingUtterances += 1
+        synthesizer.speak(makeUtterance(text))
+    }
+
+    @MainActor
+    func stop() {
+        synthesizer.stopSpeaking(at: .immediate)
+        pendingUtterances = 0
+    }
+
+    // MARK: - AVSpeechSynthesizerDelegate
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        pendingUtterances = max(0, pendingUtterances - 1)
+        guard pendingUtterances == 0 else { return }
+        Task { @MainActor in self.onFinished?() }
+    }
+
+    // MARK: - Private
+
+    private func makeUtterance(_ text: String) -> AVSpeechUtterance {
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = voice
         utterance.rate = 0.52
         utterance.pitchMultiplier = 1.1
         utterance.volume = 1.0
         utterance.preUtteranceDelay = 0.1
-        synthesizer.speak(utterance)
-    }
-
-    @MainActor
-    func stop() {
-        synthesizer.stopSpeaking(at: .immediate)
-    }
-
-    // MARK: - AVSpeechSynthesizerDelegate
-
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in
-            self.onFinished?()
-        }
+        return utterance
     }
 
     private static func preferredVoice() -> AVSpeechSynthesisVoice? {

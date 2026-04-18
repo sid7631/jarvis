@@ -10,6 +10,7 @@ final class VoiceManager {
     private let recognitionService: SpeechRecognitionService
     private let backend: any BackendService
     private var listeningVerificationTask: Task<Void, Never>?
+    private var streamingTask: Task<Void, Never>?
     private var shouldResumeWakeListeningAfterSpeech = true
     private var ignoreNextSpeechFinishedCallback = false
 
@@ -39,6 +40,7 @@ final class VoiceManager {
         isRunning = false
         listeningVerificationTask?.cancel()
         listeningVerificationTask = nil
+        cancelStreaming()
         recognitionService.stopListening(forceCancel: true)
         speechSynthesizer.stop()
         state.debugSpeechMode = "stopped"
@@ -93,19 +95,82 @@ final class VoiceManager {
     private func handleUserSpeech(_ text: String) {
         listeningVerificationTask?.cancel()
         listeningVerificationTask = nil
+        cancelStreaming()
         transitionTo(.thinking)
         state.transcribedText = text
+        state.responseText = ""
 
-        Task {
+        streamingTask = Task {
             do {
                 let request = ChatRequest(message: text, conversationId: nil)
-                let response = try await backend.sendMessage(request)
-                handleResponse(response.reply)
+                let stream = try await backend.streamResponse(request)
+
+                var buffer = ""
+                var fullResponse = ""
+                var spokFirstSentence = false
+
+                for try await chunk in stream {
+                    guard !Task.isCancelled else { return }
+                    buffer += chunk
+                    fullResponse += chunk
+                    state.responseText = fullResponse
+
+                    // Speak each complete sentence as soon as it arrives
+                    while let sentence = Self.extractNextSentence(from: &buffer) {
+                        if !spokFirstSentence {
+                            spokFirstSentence = true
+                            transitionTo(.speaking)
+                            ignoreNextSpeechFinishedCallback = false
+                            speechSynthesizer.speak(sentence)
+                            recognitionService.startWakeWordDetection()
+                        } else {
+                            speechSynthesizer.enqueue(sentence)
+                        }
+                    }
+                }
+
+                guard !Task.isCancelled else { return }
+
+                // Speak any remaining text that didn't end with punctuation
+                let remainder = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !remainder.isEmpty {
+                    if spokFirstSentence {
+                        speechSynthesizer.enqueue(remainder)
+                    } else {
+                        // Entire response had no sentence boundary — speak it all at once
+                        handleResponse(fullResponse)
+                    }
+                } else if !spokFirstSentence {
+                    handleResponse("I'm sorry, I didn't receive a response.")
+                }
+
             } catch {
+                guard !Task.isCancelled else { return }
                 state.errorMessage = error.localizedDescription
                 handleResponse("I'm sorry, I encountered an issue processing your request.")
             }
         }
+    }
+
+    /// Extracts the next complete sentence from the front of `buffer`, mutating it in place.
+    /// Splits on `.` `!` `?` followed by a space, newline, or end-of-string.
+    private static func extractNextSentence(from buffer: inout String) -> String? {
+        let enders: Set<Character> = [".", "!", "?"]
+        var i = buffer.startIndex
+        while i < buffer.endIndex {
+            if enders.contains(buffer[i]) {
+                let after = buffer.index(after: i)
+                if after == buffer.endIndex || buffer[after] == " " || buffer[after] == "\n" {
+                    let sentence = String(buffer[...i]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    buffer = after < buffer.endIndex
+                        ? String(buffer[after...]).trimmingCharacters(in: CharacterSet(charactersIn: " "))
+                        : ""
+                    return sentence.isEmpty ? nil : sentence
+                }
+            }
+            i = buffer.index(after: i)
+        }
+        return nil
     }
 
     private func handleResponse(_ text: String) {
@@ -149,10 +214,16 @@ final class VoiceManager {
     private func interruptSpeechAndListen(initialText: String? = nil) {
         listeningVerificationTask?.cancel()
         listeningVerificationTask = nil
+        cancelStreaming()
         ignoreNextSpeechFinishedCallback = true
         state.debugSpeechEvent = "Wake word detected during speech"
         speechSynthesizer.stop()
         handleWakeWord(initialText: initialText)
+    }
+
+    private func cancelStreaming() {
+        streamingTask?.cancel()
+        streamingTask = nil
     }
 
     private func scheduleListeningVerificationResponse() {
@@ -166,7 +237,7 @@ final class VoiceManager {
 
             self.state.debugSpeechEvent = "Using mock reply for voice verification"
             self.recognitionService.stopListening(forceCancel: true)
-            self.handleUserSpeech("Voice output verification")
+            self.handleResponse("Voice systems are online and operational.")
         }
     }
 
